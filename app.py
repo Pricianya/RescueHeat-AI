@@ -1,6 +1,7 @@
 import streamlit as st
 from ultralytics import YOLO
 from PIL import Image
+from pathlib import Path
 import pandas as pd
 import av
 import threading
@@ -15,7 +16,7 @@ from streamlit_geolocation import streamlit_geolocation
 
 
 # =========================================================
-# PAGE CONFIG
+# PAGE CONFIGURATION
 # =========================================================
 
 st.set_page_config(
@@ -27,17 +28,77 @@ st.set_page_config(
 
 
 # =========================================================
-# LOAD MODELS
+# PROJECT PATHS
+# =========================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+
+# Thermal model can exist in either location:
+# Local:  RescueHeatAI/models/best.pt
+# Cloud:  RescueHeatAI/best.pt
+
+LOCAL_THERMAL_MODEL = BASE_DIR / "models" / "best.pt"
+CLOUD_THERMAL_MODEL = BASE_DIR / "best.pt"
+
+RGB_MODEL_PATH = BASE_DIR / "yolo11n.pt"
+
+
+def find_thermal_model():
+
+    if LOCAL_THERMAL_MODEL.exists():
+        return LOCAL_THERMAL_MODEL
+
+    if CLOUD_THERMAL_MODEL.exists():
+        return CLOUD_THERMAL_MODEL
+
+    return None
+
+
+THERMAL_MODEL_PATH = find_thermal_model()
+
+
+# =========================================================
+# CHECK MODEL FILES
+# =========================================================
+
+if THERMAL_MODEL_PATH is None:
+
+    st.error(
+        "Thermal model best.pt was not found.\n\n"
+        "Expected either:\n"
+        "- models/best.pt\n"
+        "- best.pt"
+    )
+
+    st.stop()
+
+
+if not RGB_MODEL_PATH.exists():
+
+    st.error(
+        "RGB model yolo11n.pt was not found "
+        "in the same folder as app.py."
+    )
+
+    st.stop()
+
+
+# =========================================================
+# LOAD YOLO MODELS
 # =========================================================
 
 @st.cache_resource
 def load_thermal_model():
-    return YOLO(r"C:\RescueHeatAI\models\best.pt")
+    return YOLO(
+        str(THERMAL_MODEL_PATH)
+    )
 
 
 @st.cache_resource
 def load_rgb_model():
-    return YOLO("yolo11n.pt")
+    return YOLO(
+        str(RGB_MODEL_PATH)
+    )
 
 
 thermal_model = load_thermal_model()
@@ -48,19 +109,31 @@ rgb_model = load_rgb_model()
 # SESSION STATE
 # =========================================================
 
-defaults = {
+DEFAULTS = {
+
     "detections": [],
+
     "detection_count": 0,
+
     "avg_confidence": 0.0,
+
     "priority": "WAITING",
-    "recommendation": "No survivor detection available.",
+
+    "recommendation":
+        "No person detection available.",
+
     "latitude": 12.9716,
+
     "longitude": 77.5946,
+
     "gps_accuracy": 0.0,
+
     "gps_received": False
 }
 
-for key, value in defaults.items():
+
+for key, value in DEFAULTS.items():
+
     if key not in st.session_state:
         st.session_state[key] = value
 
@@ -70,28 +143,38 @@ for key, value in defaults.items():
 # =========================================================
 
 @st.cache_resource
-def get_live_store():
+def create_live_store():
+
     return {
+
         "count": 0,
+
         "confidence": 0.0,
+
         "max_confidence": 0.0,
+
         "lock": threading.Lock()
     }
 
 
-live_store = get_live_store()
+live_store = create_live_store()
 
 
 # =========================================================
 # CSS
 # =========================================================
 
-st.markdown("""
+st.markdown(
+    """
 <style>
 
 .stApp {
     background-color: #0f172a;
 }
+
+/* ------------------------------------------------------ */
+/* Titles */
+/* ------------------------------------------------------ */
 
 .main-title {
     font-size: 44px;
@@ -105,6 +188,11 @@ st.markdown("""
     font-size: 17px;
     margin-bottom: 20px;
 }
+
+
+/* ------------------------------------------------------ */
+/* Cards */
+/* ------------------------------------------------------ */
 
 .card {
     background-color: #172554;
@@ -130,6 +218,11 @@ st.markdown("""
     color: white;
 }
 
+
+/* ------------------------------------------------------ */
+/* Rescue priority cards */
+/* ------------------------------------------------------ */
+
 .safe-card {
     background-color: #052e16;
     border: 1px solid #22c55e;
@@ -154,6 +247,11 @@ st.markdown("""
     color: white;
 }
 
+
+/* ------------------------------------------------------ */
+/* GPS */
+/* ------------------------------------------------------ */
+
 .gps-card {
     background-color: #082f49;
     border: 1px solid #0ea5e9;
@@ -162,72 +260,115 @@ st.markdown("""
     color: white;
 }
 
+
+/* ------------------------------------------------------ */
+/* Sidebar */
+/* ------------------------------------------------------ */
+
 section[data-testid="stSidebar"] {
     background-color: #020617;
 }
+
 
 h1, h2, h3 {
     color: white;
 }
 
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True
+)
 
 
 # =========================================================
 # RESCUE STATUS
 # =========================================================
 
-def rescue_status(confidence, count):
+def rescue_status(
+    confidence,
+    count
+):
 
     if count == 0:
+
         return (
             "NO PERSON DETECTED",
-            "No rescue action triggered.",
+            "No rescue alert is currently triggered.",
             "safe-card"
         )
 
+
     if confidence >= 85:
+
         return (
             "HIGH PRIORITY RESCUE 🔴",
-            "Strong person detection. Immediate rescue verification is recommended.",
+            "Strong person detection. "
+            "Immediate rescue verification is recommended.",
             "high-card"
         )
 
-    elif confidence >= 60:
+
+    if confidence >= 60:
+
         return (
             "RESCUE CHECK NEEDED 🟠",
-            "Possible person detected. Rescue team should verify the location.",
+            "Possible person detected. "
+            "Rescue personnel should verify the location.",
             "medium-card"
         )
 
-    else:
-        return (
-            "LOW CONFIDENCE DETECTION 🟢",
-            "Possible person detection. Verify before rescue dispatch.",
-            "safe-card"
+
+    return (
+        "LOW CONFIDENCE DETECTION 🟢",
+        "Possible person detection. "
+        "Verify the detection before dispatch.",
+        "safe-card"
+    )
+
+
+# =========================================================
+# CREATE PERSON DETECTION RECORDS
+# =========================================================
+
+def create_detection_records(
+    result
+):
+
+    records = []
+
+
+    for i, box in enumerate(
+        result.boxes
+    ):
+
+        confidence = (
+            float(
+                box.conf[0]
+            )
+            * 100
         )
 
 
-# =========================================================
-# CREATE DETECTION RECORDS
-# =========================================================
-
-def create_detection_records(result):
-
-    detection_data = []
-
-    for i, box in enumerate(result.boxes):
-
-        confidence = float(box.conf[0]) * 100
-
         record = {
-            "ID": f"SUR-{i + 1:03d}",
-            "Class": "person",
-            "Confidence": round(confidence, 2)
+
+            "ID":
+                f"SUR-{i + 1:03d}",
+
+            "Class":
+                "person",
+
+            "Confidence":
+                round(
+                    confidence,
+                    2
+                )
         }
 
-        # Add GPS only when live GPS has been received
+
+        # -------------------------------------------------
+        # Attach GPS if available
+        # -------------------------------------------------
+
         if st.session_state.gps_received:
 
             record["Latitude"] = round(
@@ -245,49 +386,93 @@ def create_detection_records(result):
                 1
             )
 
+
         else:
 
-            record["Latitude"] = "GPS unavailable"
-            record["Longitude"] = "GPS unavailable"
-            record["GPS Accuracy (m)"] = "-"
+            record["Latitude"] = (
+                "GPS unavailable"
+            )
 
-        detection_data.append(record)
+            record["Longitude"] = (
+                "GPS unavailable"
+            )
 
-    return detection_data
+            record[
+                "GPS Accuracy (m)"
+            ] = "-"
+
+
+        records.append(
+            record
+        )
+
+
+    return records
 
 
 # =========================================================
 # SAVE DETECTION RESULTS
 # =========================================================
 
-def save_detection_results(detection_data):
+def save_detection_results(
+    records
+):
 
-    st.session_state.detections = detection_data
-    st.session_state.detection_count = len(detection_data)
+    st.session_state.detections = (
+        records
+    )
 
-    if detection_data:
+    st.session_state.detection_count = (
+        len(
+            records
+        )
+    )
+
+
+    if records:
 
         average = sum(
             item["Confidence"]
-            for item in detection_data
-        ) / len(detection_data)
+            for item in records
+        ) / len(records)
 
-        st.session_state.avg_confidence = average
 
-        status, recommendation, _ = rescue_status(
-            average,
-            len(detection_data)
+        st.session_state.avg_confidence = (
+            average
         )
 
-        st.session_state.priority = status
-        st.session_state.recommendation = recommendation
+
+        (
+            status,
+            recommendation,
+            _
+        ) = rescue_status(
+            average,
+            len(records)
+        )
+
+
+        st.session_state.priority = (
+            status
+        )
+
+        st.session_state.recommendation = (
+            recommendation
+        )
+
 
     else:
 
-        st.session_state.avg_confidence = 0.0
-        st.session_state.priority = "NO PERSON DETECTED"
+        st.session_state.avg_confidence = (
+            0.0
+        )
+
+        st.session_state.priority = (
+            "NO PERSON DETECTED"
+        )
+
         st.session_state.recommendation = (
-            "No rescue action triggered."
+            "No rescue alert is currently triggered."
         )
 
 
@@ -297,13 +482,18 @@ def save_detection_results(detection_data):
 
 with st.sidebar:
 
-    st.title("🛸 RESCUEHEAT AI")
+    st.title(
+        "🛸 RESCUEHEAT AI"
+    )
+
 
     st.caption(
         "Thermal-Guided Drone Intelligence"
     )
 
+
     st.divider()
+
 
     page = st.radio(
         "Navigation",
@@ -317,101 +507,148 @@ with st.sidebar:
         ]
     )
 
+
     st.divider()
 
-    st.subheader("Mission Status")
 
-    st.success("🟢 SYSTEM ONLINE")
+    st.subheader(
+        "Mission Status"
+    )
 
-    st.metric("🔋 Battery", "68%")
-    st.metric("📡 Signal", "92%")
-    st.metric("🛸 Altitude", "42 m")
+
+    st.success(
+        "🟢 SYSTEM ONLINE"
+    )
+
+
+    st.metric(
+        "🔋 Battery",
+        "68%"
+    )
+
+
+    st.metric(
+        "📡 Signal",
+        "92%"
+    )
+
+
+    st.metric(
+        "🛸 Altitude",
+        "42 m"
+    )
+
 
     if st.session_state.gps_received:
-        st.success("📍 GPS ACTIVE")
+
+        st.success(
+            "📍 GPS ACTIVE"
+        )
+
     else:
-        st.warning("📍 GPS WAITING")
+
+        st.warning(
+            "📍 GPS WAITING"
+        )
 
 
 # =========================================================
-# PAGE 1 — MISSION DASHBOARD
+# PAGE 1
+# MISSION DASHBOARD
 # =========================================================
 
 if page == "🏠 Mission Dashboard":
 
     st.markdown(
-        '<div class="main-title">Live Mission Dashboard</div>',
+        """
+        <div class="main-title">
+        Live Mission Dashboard
+        </div>
+        """,
         unsafe_allow_html=True
     )
+
 
     st.markdown(
-        '<div class="subtitle">'
-        'AI-assisted thermal search and rescue monitoring'
-        '</div>',
+        """
+        <div class="subtitle">
+        AI-assisted thermal search and rescue monitoring
+        </div>
+        """,
         unsafe_allow_html=True
     )
 
-    metric1, metric2, metric3, metric4 = st.columns(4)
 
-    count_placeholder = metric1.empty()
-    confidence_placeholder = metric2.empty()
-    priority_placeholder = metric3.empty()
-    gps_placeholder = metric4.empty()
+    # -----------------------------------------------------
+    # TOP METRICS
+    # -----------------------------------------------------
+
+    metric1, metric2, metric3, metric4 = (
+        st.columns(4)
+    )
 
 
-    def update_dashboard_metrics():
+    metric1.metric(
+        "Detected Persons",
+        st.session_state.detection_count
+    )
 
-        status, _, _ = rescue_status(
-            st.session_state.avg_confidence,
-            st.session_state.detection_count
+
+    metric2.metric(
+        "AI Confidence",
+        f"{st.session_state.avg_confidence:.1f}%"
+    )
+
+
+    metric3.metric(
+        "Mission Status",
+        st.session_state.priority
+    )
+
+
+    metric4.metric(
+        "GPS",
+        (
+            "ACTIVE"
+            if st.session_state.gps_received
+            else "WAITING"
         )
+    )
 
-        count_placeholder.metric(
-            "Detected Persons",
-            st.session_state.detection_count
-        )
-
-        confidence_placeholder.metric(
-            "AI Confidence",
-            f"{st.session_state.avg_confidence:.1f}%"
-        )
-
-        priority_placeholder.metric(
-            "Mission Status",
-            status
-        )
-
-        if st.session_state.gps_received:
-            gps_placeholder.metric(
-                "GPS",
-                "ACTIVE"
-            )
-        else:
-            gps_placeholder.metric(
-                "GPS",
-                "WAITING"
-            )
-
-
-    update_dashboard_metrics()
 
     st.divider()
 
-    left, right = st.columns([1.5, 1])
 
     # -----------------------------------------------------
-    # THERMAL FEED
+    # MAIN AREA
     # -----------------------------------------------------
+
+    left, right = st.columns(
+        [1.5, 1]
+    )
+
+
+    # =====================================================
+    # LEFT SIDE
+    # =====================================================
 
     with left:
 
-        st.subheader("🌡️ Thermal Feed")
+        st.subheader(
+            "🌡️ Thermal Feed"
+        )
+
 
         dashboard_file = st.file_uploader(
             "Upload current thermal frame",
-            type=["jpg", "jpeg", "png"],
+            type=[
+                "jpg",
+                "jpeg",
+                "png"
+            ],
             key="dashboard_upload"
         )
+
 
         if dashboard_file is not None:
 
@@ -419,11 +656,13 @@ if page == "🏠 Mission Dashboard":
                 dashboard_file
             )
 
+
             st.image(
                 dashboard_image,
                 caption="Thermal Camera Feed",
                 use_container_width=True
             )
+
 
             if st.button(
                 "🔍 Run Thermal AI Detection",
@@ -435,55 +674,59 @@ if page == "🏠 Mission Dashboard":
                     "Analyzing thermal image..."
                 ):
 
-                    results = thermal_model.predict(
-                        source=dashboard_image,
-                        conf=0.25,
-                        classes=[0],
-                        verbose=False
+                    results = (
+                        thermal_model.predict(
+                            source=dashboard_image,
+                            conf=0.25,
+                            classes=[0],
+                            verbose=False
+                        )
                     )
+
 
                 result = results[0]
 
-                annotated = result.plot()
 
                 st.image(
-                    annotated,
+                    result.plot(),
                     caption="Thermal YOLO Detection",
                     use_container_width=True
                 )
 
-                # =========================================
-                # PERSON + GPS RECORDS
-                # =========================================
 
-                detection_data = create_detection_records(
-                    result
+                records = (
+                    create_detection_records(
+                        result
+                    )
                 )
+
 
                 save_detection_results(
-                    detection_data
+                    records
                 )
 
-                if detection_data:
+
+                if records:
 
                     st.success(
-                        f"👤 {len(detection_data)} "
+                        f"👤 {len(records)} "
                         "person(s) detected."
                     )
+
 
                     if st.session_state.gps_received:
 
                         st.success(
-                            "📍 GPS coordinates attached "
-                            "to the detection."
+                            "📍 GPS coordinates attached."
                         )
 
                     else:
 
                         st.warning(
-                            "Person detected, but live GPS "
+                            "Person detected, but GPS "
                             "has not been captured yet."
                         )
+
 
                 else:
 
@@ -491,17 +734,17 @@ if page == "🏠 Mission Dashboard":
                         "No person detected."
                     )
 
-                update_dashboard_metrics()
 
-    # -----------------------------------------------------
-    # MISSION INFORMATION
-    # -----------------------------------------------------
+    # =====================================================
+    # RIGHT SIDE
+    # =====================================================
 
     with right:
 
         st.subheader(
             "🚨 Mission Information"
         )
+
 
         (
             status,
@@ -512,11 +755,14 @@ if page == "🏠 Mission Dashboard":
             st.session_state.detection_count
         )
 
+
         st.markdown(
             f"""
             <div class="{css_class}">
 
-            <h3>Detected Persons</h3>
+            <h3>
+            Detected Persons
+            </h3>
 
             <h1>
             {st.session_state.detection_count}
@@ -524,7 +770,9 @@ if page == "🏠 Mission Dashboard":
 
             <hr>
 
-            <h3>Average Confidence</h3>
+            <h3>
+            Average Confidence
+            </h3>
 
             <h1>
             {st.session_state.avg_confidence:.1f}%
@@ -532,7 +780,9 @@ if page == "🏠 Mission Dashboard":
 
             <hr>
 
-            <h3>Rescue Decision</h3>
+            <h3>
+            Rescue Decision
+            </h3>
 
             <h2>
             {status}
@@ -543,9 +793,14 @@ if page == "🏠 Mission Dashboard":
             unsafe_allow_html=True
         )
 
+
         st.write("")
 
-        st.info(recommendation)
+
+        st.info(
+            recommendation
+        )
+
 
         if st.session_state.detection_count > 0:
 
@@ -553,7 +808,9 @@ if page == "🏠 Mission Dashboard":
                 """
                 <div class="alert-card">
 
-                🚨 <b>RESCUE ALERT</b>
+                🚨 <b>
+                RESCUE ALERT
+                </b>
 
                 <br><br>
 
@@ -561,23 +818,27 @@ if page == "🏠 Mission Dashboard":
 
                 <br><br>
 
-                Verify detection and location before
-                dispatching the rescue team.
+                Verify the detection and location
+                before rescue dispatch.
 
                 </div>
                 """,
                 unsafe_allow_html=True
             )
 
+
             if st.session_state.gps_received:
 
                 st.write("")
+
 
                 st.markdown(
                     f"""
                     <div class="gps-card">
 
-                    <h3>📍 Detection Location</h3>
+                    <h3>
+                    📍 Detection Location
+                    </h3>
 
                     <b>Latitude:</b>
                     {st.session_state.latitude:.6f}
@@ -597,27 +858,32 @@ if page == "🏠 Mission Dashboard":
                     unsafe_allow_html=True
                 )
 
+
     # -----------------------------------------------------
     # DETECTION TABLE
     # -----------------------------------------------------
 
     st.divider()
 
+
     st.subheader(
         "📊 Detection Details"
     )
 
+
     if st.session_state.detections:
 
-        df = pd.DataFrame(
+        detection_df = pd.DataFrame(
             st.session_state.detections
         )
 
+
         st.dataframe(
-            df,
+            detection_df,
             use_container_width=True,
             hide_index=True
         )
+
 
     else:
 
@@ -625,15 +891,18 @@ if page == "🏠 Mission Dashboard":
             "Run thermal detection to display results."
         )
 
+
     # -----------------------------------------------------
-    # LOCATION MAP
+    # MAP
     # -----------------------------------------------------
 
     st.divider()
 
+
     st.subheader(
         "📍 Current Mission Location"
     )
+
 
     if st.session_state.gps_received:
 
@@ -642,65 +911,81 @@ if page == "🏠 Mission Dashboard":
                 "lat": [
                     st.session_state.latitude
                 ],
+
                 "lon": [
                     st.session_state.longitude
                 ]
             }
         )
 
+
         st.map(
             map_data,
             zoom=16
         )
 
+
     else:
 
         st.info(
-            "Open GPS Locations and capture your "
-            "location to display the live mission map."
+            "Open GPS Locations and capture "
+            "your current position first."
         )
 
 
 # =========================================================
-# PAGE 2 — THERMAL DETECTION
+# PAGE 2
+# THERMAL DETECTION
 # =========================================================
 
 elif page == "🌡️ Thermal Detection":
 
     st.markdown(
-        '<div class="main-title">'
-        'Thermal Human Detection'
-        '</div>',
+        """
+        <div class="main-title">
+        Thermal Human Detection
+        </div>
+        """,
         unsafe_allow_html=True
     )
 
+
     st.markdown(
-        '<div class="subtitle">'
-        'Custom YOLO model trained on AIResQ'
-        '</div>',
+        """
+        <div class="subtitle">
+        Custom YOLO model trained on AIResQ
+        </div>
+        """,
         unsafe_allow_html=True
     )
+
 
     if st.session_state.gps_received:
 
         st.success(
-            "📍 GPS ACTIVE — coordinates will automatically "
-            "be attached to detected persons."
+            "📍 GPS ACTIVE — coordinates will "
+            "be attached to detections."
         )
+
 
     else:
 
         st.warning(
-            "📍 GPS has not been captured. "
-            "Open GPS Locations first if you want "
-            "coordinates attached to detections."
+            "📍 GPS is not active. "
+            "Capture GPS first if coordinates are required."
         )
+
 
     uploaded_file = st.file_uploader(
         "Upload Thermal Image",
-        type=["jpg", "jpeg", "png"],
+        type=[
+            "jpg",
+            "jpeg",
+            "png"
+        ],
         key="thermal_detection"
     )
+
 
     if uploaded_file is not None:
 
@@ -708,29 +993,44 @@ elif page == "🌡️ Thermal Detection":
             uploaded_file
         )
 
-        c1, c2 = st.columns(2)
 
-        with c1:
+        image_col, result_col = (
+            st.columns(2)
+        )
+
+
+        # -------------------------------------------------
+        # INPUT
+        # -------------------------------------------------
+
+        with image_col:
 
             st.subheader(
                 "Input Thermal Image"
             )
+
 
             st.image(
                 image,
                 use_container_width=True
             )
 
-        with c2:
+
+        # -------------------------------------------------
+        # RESULT
+        # -------------------------------------------------
+
+        with result_col:
 
             st.subheader(
                 "AI Detection Result"
             )
 
+
             if st.button(
                 "🔍 Detect Person",
                 type="primary",
-                key="thermal_button"
+                key="thermal_detect_button"
             ):
 
                 with st.spinner(
@@ -744,34 +1044,34 @@ elif page == "🌡️ Thermal Detection":
                         verbose=False
                     )
 
+
                 result = results[0]
 
-                annotated = result.plot()
 
                 st.image(
-                    annotated,
+                    result.plot(),
                     use_container_width=True
                 )
 
-                # =========================================
-                # CREATE PERSON + GPS RECORDS
-                # =========================================
 
-                detection_data = (
+                records = (
                     create_detection_records(
                         result
                     )
                 )
 
+
                 save_detection_results(
-                    detection_data
+                    records
                 )
 
-                if detection_data:
+
+                if records:
 
                     avg = (
                         st.session_state.avg_confidence
                     )
+
 
                     (
                         status,
@@ -779,13 +1079,15 @@ elif page == "🌡️ Thermal Detection":
                         css_class
                     ) = rescue_status(
                         avg,
-                        len(detection_data)
+                        len(records)
                     )
 
+
                     st.success(
-                        f"👤 {len(detection_data)} "
+                        f"👤 {len(records)} "
                         "person(s) detected."
                     )
+
 
                     st.markdown(
                         f"""
@@ -811,43 +1113,11 @@ elif page == "🌡️ Thermal Detection":
                         unsafe_allow_html=True
                     )
 
+
                     st.info(
                         recommendation
                     )
 
-                    if st.session_state.gps_received:
-
-                        st.markdown(
-                            f"""
-                            <div class="gps-card">
-
-                            <h3>
-                            📍 Detection GPS
-                            </h3>
-
-                            Latitude:
-                            <b>
-                            {st.session_state.latitude:.6f}
-                            </b>
-
-                            <br><br>
-
-                            Longitude:
-                            <b>
-                            {st.session_state.longitude:.6f}
-                            </b>
-
-                            <br><br>
-
-                            Accuracy:
-                            <b>
-                            {st.session_state.gps_accuracy:.0f} m
-                            </b>
-
-                            </div>
-                            """,
-                            unsafe_allow_html=True
-                        )
 
                 else:
 
@@ -855,63 +1125,72 @@ elif page == "🌡️ Thermal Detection":
                         "No person detected."
                     )
 
+
         # -------------------------------------------------
-        # RESULT TABLE
+        # TABLE
         # -------------------------------------------------
 
         if st.session_state.detections:
 
             st.divider()
 
+
             st.subheader(
-                "📊 Person Detection Records"
+                "📊 Detection Records"
             )
 
-            detection_df = pd.DataFrame(
-                st.session_state.detections
-            )
 
             st.dataframe(
-                detection_df,
+                pd.DataFrame(
+                    st.session_state.detections
+                ),
                 use_container_width=True,
                 hide_index=True
             )
 
+
     else:
 
         st.info(
-            "Upload a thermal image "
-            "to begin detection."
+            "Upload a thermal image to begin detection."
         )
 
 
 # =========================================================
-# PAGE 3 — LIVE DETECTION
+# PAGE 3
+# LIVE DETECTION
 # =========================================================
 
 elif page == "📹 Live Detection":
 
     st.markdown(
-        '<div class="main-title">'
-        'Continuous Live Detection'
-        '</div>',
+        """
+        <div class="main-title">
+        Continuous Live Detection
+        </div>
+        """,
         unsafe_allow_html=True
     )
+
 
     st.markdown(
-        '<div class="subtitle">'
-        'Real-time human detection from a live camera'
-        '</div>',
+        """
+        <div class="subtitle">
+        Real-time person detection from a live camera
+        </div>
+        """,
         unsafe_allow_html=True
     )
 
+
     st.warning(
-        "Laptop camera = RGB mode. "
+        "Laptop webcam = RGB mode. "
         "Actual thermal camera = Thermal mode."
     )
 
+
     camera_mode = st.radio(
-        "Select Live Camera Mode",
+        "Select Camera Mode",
         [
             "💻 Laptop / RGB Camera",
             "🌡️ Thermal Camera"
@@ -919,42 +1198,62 @@ elif page == "📹 Live Detection":
         horizontal=True
     )
 
+
+    # -----------------------------------------------------
+    # SELECT MODEL
+    # -----------------------------------------------------
+
     if camera_mode == "💻 Laptop / RGB Camera":
 
         live_model = rgb_model
-        confidence_threshold = 0.45
+
+        confidence_threshold = (
+            0.45
+        )
+
 
         st.success(
-            "RGB mode active."
+            "RGB detection mode active."
         )
+
 
     else:
 
         live_model = thermal_model
-        confidence_threshold = 0.25
 
-        st.success(
-            "Thermal mode active."
+        confidence_threshold = (
+            0.25
         )
 
+
+        st.success(
+            "Thermal detection mode active."
+        )
+
+
     st.divider()
+
 
     st.subheader(
         "📹 Live Camera"
     )
 
 
-    # -----------------------------------------------------
-    # LIVE VIDEO PROCESSOR
-    # -----------------------------------------------------
+    # =====================================================
+    # WEBRTC PROCESSOR
+    # =====================================================
 
     class RescueHeatProcessor:
 
-        def recv(self, frame):
+        def recv(
+            self,
+            frame
+        ):
 
             image = frame.to_ndarray(
                 format="bgr24"
             )
+
 
             results = live_model.predict(
                 source=image,
@@ -963,51 +1262,78 @@ elif page == "📹 Live Detection":
                 verbose=False
             )
 
+
             result = results[0]
 
-            confidences = []
 
-            for box in result.boxes:
+            confidences = [
 
-                confidences.append(
-                    float(box.conf[0]) * 100
-                )
+                float(
+                    box.conf[0]
+                ) * 100
+
+                for box
+                in result.boxes
+            ]
+
 
             with live_store["lock"]:
 
-                live_store["count"] = len(
-                    result.boxes
+                live_store["count"] = (
+                    len(
+                        result.boxes
+                    )
                 )
+
 
                 if confidences:
 
-                    live_store["confidence"] = (
+                    live_store[
+                        "confidence"
+                    ] = (
                         sum(confidences)
                         / len(confidences)
                     )
 
-                    live_store["max_confidence"] = (
-                        max(confidences)
+
+                    live_store[
+                        "max_confidence"
+                    ] = max(
+                        confidences
                     )
+
 
                 else:
 
-                    live_store["confidence"] = 0.0
-                    live_store["max_confidence"] = 0.0
+                    live_store[
+                        "confidence"
+                    ] = 0.0
 
-            annotated = result.plot()
 
-            return av.VideoFrame.from_ndarray(
-                annotated,
-                format="bgr24"
+                    live_store[
+                        "max_confidence"
+                    ] = 0.0
+
+
+            annotated = (
+                result.plot()
             )
 
 
-    # -----------------------------------------------------
-    # WEBRTC CAMERA
-    # -----------------------------------------------------
+            return (
+                av.VideoFrame.from_ndarray(
+                    annotated,
+                    format="bgr24"
+                )
+            )
+
+
+    # =====================================================
+    # START WEBRTC
+    # =====================================================
 
     webrtc_streamer(
+
         key=f"rescueheat-{camera_mode}",
 
         mode=WebRtcMode.SENDRECV,
@@ -1036,18 +1362,22 @@ elif page == "📹 Live Detection":
         async_processing=True
     )
 
+
     st.divider()
+
 
     st.subheader(
         "🚨 Live Rescue Decision"
     )
 
 
-    # -----------------------------------------------------
-    # AUTO-REFRESH LIVE STATUS
-    # -----------------------------------------------------
+    # =====================================================
+    # AUTO-REFRESH STATUS
+    # =====================================================
 
-    @st.fragment(run_every="0.5s")
+    @st.fragment(
+        run_every="0.5s"
+    )
     def live_status_panel():
 
         with live_store["lock"]:
@@ -1056,13 +1386,18 @@ elif page == "📹 Live Detection":
                 live_store["count"]
             )
 
+
             live_conf = (
                 live_store["confidence"]
             )
 
+
             max_conf = (
-                live_store["max_confidence"]
+                live_store[
+                    "max_confidence"
+                ]
             )
+
 
         (
             status,
@@ -1073,37 +1408,35 @@ elif page == "📹 Live Detection":
             live_count
         )
 
-        col1, col2, col3, col4 = (
+
+        c1, c2, c3, c4 = (
             st.columns(4)
         )
 
-        with col1:
 
-            st.metric(
-                "Persons Detected",
-                live_count
-            )
+        c1.metric(
+            "Persons Detected",
+            live_count
+        )
 
-        with col2:
 
-            st.metric(
-                "Average Confidence",
-                f"{live_conf:.1f}%"
-            )
+        c2.metric(
+            "Average Confidence",
+            f"{live_conf:.1f}%"
+        )
 
-        with col3:
 
-            st.metric(
-                "Highest Confidence",
-                f"{max_conf:.1f}%"
-            )
+        c3.metric(
+            "Highest Confidence",
+            f"{max_conf:.1f}%"
+        )
 
-        with col4:
 
-            st.metric(
-                "Rescue Status",
-                status
-            )
+        c4.metric(
+            "Rescue Status",
+            status
+        )
+
 
         if live_count > 0:
 
@@ -1116,18 +1449,24 @@ elif page == "📹 Live Detection":
                 </h2>
 
                 <p>
-                👤 <b>{live_count}</b>
+                👤 <b>
+                {live_count}
+                </b>
                 person(s) currently detected.
                 </p>
 
                 <p>
                 Average confidence:
-                <b>{live_conf:.1f}%</b>
+                <b>
+                {live_conf:.1f}%
+                </b>
                 </p>
 
                 <p>
                 Highest confidence:
-                <b>{max_conf:.1f}%</b>
+                <b>
+                {max_conf:.1f}%
+                </b>
                 </p>
 
                 <p>
@@ -1139,13 +1478,11 @@ elif page == "📹 Live Detection":
                 unsafe_allow_html=True
             )
 
-            # =============================================
-            # SHOW GPS WITH LIVE DETECTION
-            # =============================================
 
             if st.session_state.gps_received:
 
                 st.write("")
+
 
                 st.markdown(
                     f"""
@@ -1155,17 +1492,26 @@ elif page == "📹 Live Detection":
                     📍 Current Rescue Coordinates
                     </h3>
 
-                    <b>Latitude:</b>
+                    <b>
+                    Latitude:
+                    </b>
+
                     {st.session_state.latitude:.6f}
 
                     <br><br>
 
-                    <b>Longitude:</b>
+                    <b>
+                    Longitude:
+                    </b>
+
                     {st.session_state.longitude:.6f}
 
                     <br><br>
 
-                    <b>GPS Accuracy:</b>
+                    <b>
+                    GPS Accuracy:
+                    </b>
+
                     {st.session_state.gps_accuracy:.0f} m
 
                     </div>
@@ -1173,12 +1519,14 @@ elif page == "📹 Live Detection":
                     unsafe_allow_html=True
                 )
 
+
             else:
 
                 st.warning(
-                    "📍 Person detected, but GPS "
-                    "location has not been captured."
+                    "Person detected but GPS "
+                    "location is not available."
                 )
+
 
         else:
 
@@ -1191,8 +1539,8 @@ elif page == "📹 Live Detection":
                 </h2>
 
                 <p>
-                No human detection is currently
-                present in the camera frame.
+                No person is currently detected
+                in the camera frame.
                 </p>
 
                 </div>
@@ -1200,9 +1548,11 @@ elif page == "📹 Live Detection":
                 unsafe_allow_html=True
             )
 
+
         st.caption(
-            "Rescue status is based on AI detection "
-            "confidence only. It is not a medical assessment."
+            "Rescue priority is based on "
+            "AI detection confidence only. "
+            "It is not a medical assessment."
         )
 
 
@@ -1210,130 +1560,159 @@ elif page == "📹 Live Detection":
 
 
 # =========================================================
-# PAGE 4 — GPS LOCATIONS
+# PAGE 4
+# GPS LOCATIONS
 # =========================================================
 
 elif page == "📍 GPS Locations":
 
     st.markdown(
-        '<div class="main-title">'
-        'Live Rescue GPS Location'
-        '</div>',
+        """
+        <div class="main-title">
+        Live Rescue GPS Location
+        </div>
+        """,
         unsafe_allow_html=True
     )
+
 
     st.markdown(
-        '<div class="subtitle">'
-        'Capture current coordinates '
-        'for rescue-team navigation'
-        '</div>',
+        """
+        <div class="subtitle">
+        Capture coordinates for rescue navigation
+        </div>
+        """,
         unsafe_allow_html=True
     )
 
+
     st.info(
-        "Click the location button below. "
-        "When the browser asks for location permission, "
-        "select Allow."
+        "Click the location button below and "
+        "allow location permission in your browser."
     )
 
-    # -----------------------------------------------------
-    # GET BROWSER GPS
-    # -----------------------------------------------------
-
-    location = streamlit_geolocation()
 
     # -----------------------------------------------------
-    # GPS RECEIVED
+    # GET GPS
+    # -----------------------------------------------------
+
+    location = (
+        streamlit_geolocation()
+    )
+
+
+    # -----------------------------------------------------
+    # VALID LOCATION
     # -----------------------------------------------------
 
     if (
         location
-        and location.get("latitude") is not None
-        and location.get("longitude") is not None
+        and location.get(
+            "latitude"
+        ) is not None
+        and location.get(
+            "longitude"
+        ) is not None
     ):
 
         latitude = float(
             location["latitude"]
         )
 
+
         longitude = float(
             location["longitude"]
         )
+
 
         accuracy = location.get(
             "accuracy",
             0
         )
 
+
         if accuracy is None:
+
             accuracy = 0
 
-        accuracy = float(accuracy)
 
-        # Save latest GPS
-        st.session_state.latitude = latitude
-        st.session_state.longitude = longitude
-        st.session_state.gps_accuracy = accuracy
-        st.session_state.gps_received = True
+        accuracy = float(
+            accuracy
+        )
+
+
+        # -------------------------------------------------
+        # SAVE GPS
+        # -------------------------------------------------
+
+        st.session_state.latitude = (
+            latitude
+        )
+
+
+        st.session_state.longitude = (
+            longitude
+        )
+
+
+        st.session_state.gps_accuracy = (
+            accuracy
+        )
+
+
+        st.session_state.gps_received = (
+            True
+        )
+
 
         st.success(
-            "📡 GPS location received successfully!"
+            "📡 GPS location received!"
         )
+
 
         # -------------------------------------------------
         # GPS METRICS
         # -------------------------------------------------
 
-        col1, col2, col3, col4 = (
+        g1, g2, g3, g4 = (
             st.columns(4)
         )
 
-        with col1:
 
-            st.metric(
-                "GPS Status",
-                "ACTIVE"
+        g1.metric(
+            "GPS Status",
+            "ACTIVE"
+        )
+
+
+        g2.metric(
+            "Latitude",
+            f"{latitude:.6f}"
+        )
+
+
+        g3.metric(
+            "Longitude",
+            f"{longitude:.6f}"
+        )
+
+
+        g4.metric(
+            "Accuracy",
+            (
+                f"{accuracy:.0f} m"
+                if accuracy > 0
+                else "Unknown"
             )
+        )
 
-        with col2:
-
-            st.metric(
-                "Latitude",
-                f"{latitude:.6f}"
-            )
-
-        with col3:
-
-            st.metric(
-                "Longitude",
-                f"{longitude:.6f}"
-            )
-
-        with col4:
-
-            if accuracy > 0:
-
-                st.metric(
-                    "Accuracy",
-                    f"{accuracy:.0f} m"
-                )
-
-            else:
-
-                st.metric(
-                    "Accuracy",
-                    "Unknown"
-                )
 
         st.divider()
 
-        # -------------------------------------------------
-        # GPS INFORMATION
-        # -------------------------------------------------
 
-        st.subheader(
-            "📍 Current Rescue Coordinates"
-        )
+        # -------------------------------------------------
+        # GPS CARD
+        # -------------------------------------------------
 
         st.markdown(
             f"""
@@ -1374,181 +1753,167 @@ elif page == "📍 GPS Locations":
             unsafe_allow_html=True
         )
 
+
         st.divider()
+
 
         # -------------------------------------------------
         # MAP
         # -------------------------------------------------
 
         st.subheader(
-            "🗺️ Live Rescue Location Map"
+            "🗺️ Rescue Location Map"
         )
 
-        location_data = pd.DataFrame(
+
+        gps_df = pd.DataFrame(
             {
-                "lat": [latitude],
-                "lon": [longitude]
+                "lat": [
+                    latitude
+                ],
+
+                "lon": [
+                    longitude
+                ]
             }
         )
 
+
         st.map(
-            location_data,
+            gps_df,
             zoom=16
         )
 
+
         st.success(
-            "📍 GPS is ready. New person detections "
-            "can now be associated with these coordinates."
+            "📍 GPS ready for detection records."
         )
+
 
         st.warning(
-            "Hackathon demo: this is the browser/laptop "
-            "location. In the final drone system, GPS "
-            "coordinates should come from the drone."
+            "Prototype: this is the browser/device "
+            "location. In the final drone system, "
+            "coordinates should come from the drone GPS."
         )
 
-    # -----------------------------------------------------
-    # WAITING FOR GPS
-    # -----------------------------------------------------
 
     else:
 
         st.warning(
-            "📡 Waiting for GPS location. "
-            "Click the location button and allow "
-            "location access."
+            "📡 Waiting for GPS location."
         )
+
 
         if st.session_state.gps_received:
 
-            st.subheader(
-                "📍 Last Known Location"
-            )
-
-            last_lat = (
-                st.session_state.latitude
-            )
-
-            last_lon = (
-                st.session_state.longitude
-            )
-
-            last_accuracy = (
-                st.session_state.gps_accuracy
-            )
-
-            col1, col2, col3 = (
-                st.columns(3)
-            )
-
-            with col1:
-
-                st.metric(
-                    "Latitude",
-                    f"{last_lat:.6f}"
-                )
-
-            with col2:
-
-                st.metric(
-                    "Longitude",
-                    f"{last_lon:.6f}"
-                )
-
-            with col3:
-
-                st.metric(
-                    "Accuracy",
-                    f"{last_accuracy:.0f} m"
-                )
-
-            last_location_data = pd.DataFrame(
+            last_location = pd.DataFrame(
                 {
-                    "lat": [last_lat],
-                    "lon": [last_lon]
+                    "lat": [
+                        st.session_state.latitude
+                    ],
+
+                    "lon": [
+                        st.session_state.longitude
+                    ]
                 }
             )
 
-            st.map(
-                last_location_data,
-                zoom=16
+
+            st.subheader(
+                "Last Known Location"
             )
 
-        else:
 
-            st.info(
-                "No live GPS location has "
-                "been received yet."
+            st.map(
+                last_location,
+                zoom=16
             )
 
 
 # =========================================================
-# PAGE 5 — MISSION WORKFLOW
+# PAGE 5
+# WORKFLOW
 # =========================================================
 
 elif page == "🔄 Mission Workflow":
 
     st.markdown(
-        '<div class="main-title">'
-        'End-to-End Mission Workflow'
-        '</div>',
+        """
+        <div class="main-title">
+        End-to-End Mission Workflow
+        </div>
+        """,
         unsafe_allow_html=True
     )
+
 
     st.markdown(
-        '<div class="subtitle">'
-        'From drone search to rescue response'
-        '</div>',
+        """
+        <div class="subtitle">
+        From drone search to rescue response
+        </div>
+        """,
         unsafe_allow_html=True
     )
 
+
     workflow = [
+
         (
             "1",
             "🛸 Drone",
             "Search disaster area"
         ),
+
         (
             "2",
             "🌡️ Thermal",
             "Capture heat signatures"
         ),
+
         (
             "3",
-            "📹 Frames",
+            "📹 Live Frames",
             "Continuous video input"
         ),
+
         (
             "4",
             "🤖 YOLO",
             "Detect possible people"
         ),
+
         (
             "5",
             "📊 Confidence",
             "Measure detection certainty"
         ),
+
         (
             "6",
             "🚦 Decision",
             "Assign rescue priority"
         ),
+
         (
             "7",
             "📍 GPS",
-            "Attach location coordinates"
+            "Attach coordinates"
         ),
+
         (
             "8",
             "🚨 Alert",
             "Notify rescue team"
         ),
+
         (
             "9",
             "🚑 Rescue",
-            "Human verification and response"
+            "Human verification"
         )
     ]
+
 
     for i in range(
         0,
@@ -1558,9 +1923,12 @@ elif page == "🔄 Mission Workflow":
 
         cols = st.columns(3)
 
+
         for col, step in zip(
             cols,
-            workflow[i:i + 3]
+            workflow[
+                i:i + 3
+            ]
         ):
 
             with col:
@@ -1592,71 +1960,88 @@ elif page == "🔄 Mission Workflow":
                     unsafe_allow_html=True
                 )
 
+
         st.write("")
 
 
 # =========================================================
-# PAGE 6 — TECHNOLOGY STACK
+# PAGE 6
+# TECHNOLOGY STACK
 # =========================================================
 
 elif page == "⚙️ Technology Stack":
 
     st.markdown(
-        '<div class="main-title">'
-        'Technology Stack'
-        '</div>',
+        """
+        <div class="main-title">
+        Technology Stack
+        </div>
+        """,
         unsafe_allow_html=True
     )
+
 
     st.markdown(
-        '<div class="subtitle">'
-        'Technologies powering RescueHeat AI'
-        '</div>',
+        """
+        <div class="subtitle">
+        Technologies powering RescueHeat AI
+        </div>
+        """,
         unsafe_allow_html=True
     )
 
+
     technologies = [
+
         (
             "🐍",
             "Python",
             "Core programming"
         ),
+
         (
             "🤖",
             "YOLO",
             "Person detection"
         ),
+
         (
             "🔥",
             "PyTorch",
-            "Deep-learning backend"
+            "Deep learning"
         ),
+
         (
             "🌡️",
             "AIResQ",
-            "Thermal training dataset"
+            "Thermal dataset"
         ),
+
         (
             "📹",
             "WebRTC",
-            "Continuous camera streaming"
+            "Live streaming"
         ),
+
         (
             "📊",
             "Streamlit",
             "Mission dashboard"
         ),
+
         (
             "📍",
             "GPS",
             "Location tracking"
         ),
+
         (
             "🛸",
             "Drone",
             "Aerial search platform"
         )
     ]
+
 
     for i in range(
         0,
@@ -1666,9 +2051,12 @@ elif page == "⚙️ Technology Stack":
 
         cols = st.columns(4)
 
+
         for col, tech in zip(
             cols,
-            technologies[i:i + 4]
+            technologies[
+                i:i + 4
+            ]
         ):
 
             with col:
@@ -1700,13 +2088,17 @@ elif page == "⚙️ Technology Stack":
                     unsafe_allow_html=True
                 )
 
+
         st.write("")
 
+
     st.divider()
+
 
     st.subheader(
         "🏗️ System Architecture"
     )
+
 
     st.markdown(
         """
@@ -1753,6 +2145,7 @@ elif page == "⚙️ Technology Stack":
 # =========================================================
 
 st.divider()
+
 
 st.caption(
     "RescueHeat AI • Hackathon Prototype • "
